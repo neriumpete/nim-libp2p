@@ -13,7 +13,119 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  setup-dependencies:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: linux
+            cpu: amd64
+          - os: linux
+            cpu: i386
+          - os: linux-gcc-14
+            cpu: amd64
+          - os: macos
+            cpu: amd64
+          - os: macos-14
+            cpu: arm64
+          - os: windows
+            cpu: amd64
+        nim:
+          - ref: version-1-6
+            memory_management: refc
+          - ref: version-2-0
+            memory_management: refc
+        include:
+          - platform:
+              os: linux
+            builder: ubuntu-22.04
+            shell: bash
+          - platform:
+              os: linux-gcc-14
+            builder: ubuntu-24.04
+            shell: bash
+          - platform:
+              os: macos
+            builder: macos-13
+            shell: bash
+          - platform:
+              os: macos-14
+            builder: macos-14
+            shell: bash
+          - platform:
+              os: windows
+            builder: windows-2022
+            shell: msys2 {0}
+
+    name: 'Setup (${ { matrix.platform.os } }-${ { matrix.platform.cpu } }, Nim ${ { matrix.nim.ref } })'
+    runs-on: ${{ matrix.builder }}
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup Nim
+        uses: "./.github/actions/install_nim"
+        with:
+          os: ${{ matrix.platform.os }}
+          cpu: ${{ matrix.platform.cpu }}
+          shell: ${{ matrix.shell }}
+          nim_ref: ${{ matrix.nim.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '~1.16.0' # That's the minimum Go version that works with arm.
+
+      - name: Restore deps from cache
+        id: deps-cache
+        uses: actions/cache@v3
+        with:
+          path: nimbledeps
+          # Using nim.ref as a simple way to differentiate between nimble using the "pkgs" or "pkgs2" directories.
+          # The change happened on Nimble v0.14.0. Also forcing the deps to be reinstalled on each os and cpu.
+          key: nimbledeps-${{ matrix.nim.ref }}-${{ matrix.builder }}-${{ matrix.platform.cpu }}-${{ hashFiles('.pinned') }} # hashFiles returns a different value on windows
+
+      - name: Setup python
+        run: |
+          mkdir -p .venv
+          python -m venv .venv
+
+      - name: Install deps (if cache miss)
+        if: ${{ steps.deps-cache.outputs.cache-hit != 'true' }}
+        run: |
+          source .venv/bin/activate
+          nimble install_pinned
+
+      # For the special gcc-14 config
+      - name: Use gcc 14
+        if : ${{ matrix.platform.os == 'linux-gcc-14'}}
+        run: |
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 14
+          sudo update-alternatives --set gcc /usr/bin/gcc-14
+
+      # Cache or build p2pd
+      - name: Restore p2pd cache
+        id: p2pd-cache
+        uses: actions/cache@v3
+        with:
+          path: p2pd
+          key: p2pd-${{ matrix.platform.os }}-${{ matrix.platform.cpu }}-${{ matrix.nim.ref }}-${{ hashFiles('.pinned') }}
+
+      - name: Build p2pd (if cache miss)
+        if: ${{ steps.p2pd-cache.outputs.cache-hit != 'true' }}
+        run: |
+          V=1 bash scripts/build_p2pd.sh p2pdCache 124530a3  # Example pinned commit
+
   test:
+    needs: setup-dependencies
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -58,17 +170,29 @@ jobs:
             builder: windows-2022
             shell: msys2 {0}
 
+    name: 'Test (${{ matrix.platform.os }}-${{ matrix.platform.cpu }}, Nim ${{ matrix.nim.ref }})'
+    runs-on: ${{ matrix.builder }}
     defaults:
       run:
         shell: ${{ matrix.shell }}
 
-    name: '${{ matrix.platform.os }}-${{ matrix.platform.cpu }} (Nim ${{ matrix.nim.ref }})'
-    runs-on: ${{ matrix.builder }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Restore Nimble deps from cache
+        uses: actions/cache@v3
+        with:
+          path: nimbledeps
+          key: nimbledeps-${{ matrix.nim.ref }}-${{ matrix.builder }}-${{ matrix.platform.cpu }}-${{ hashFiles('.pinned') }}
+
+      - name: Restore p2pd from cache
+        uses: actions/cache@v3
+        with:
+          path: p2pd
+          key: p2pd-${{ matrix.platform.os }}-${{ matrix.platform.cpu }}-${{ matrix.nim.ref }}-${{ hashFiles('.pinned') }}
 
       - name: Setup Nim
         uses: "./.github/actions/install_nim"
@@ -81,39 +205,17 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '~1.16.0' # That's the minimum Go version that works with arm.
+          go-version: '~1.16.0'
 
-      - name: Install p2pd
+      - name: Setup Python
         run: |
-          V=1 bash scripts/build_p2pd.sh p2pdCache 124530a3
-
-      - name: Restore deps from cache
-        id: deps-cache
-        uses: actions/cache@v3
-        with:
-          path: nimbledeps
-          # Using nim.ref as a simple way to differentiate between nimble using the "pkgs" or "pkgs2" directories.
-          # The change happened on Nimble v0.14.0. Also forcing the deps to be reinstalled on each os and cpu.
-          key: nimbledeps-${{ matrix.nim.ref }}-${{ matrix.builder }}-${{ matrix.platform.cpu }}-${{ hashFiles('.pinned') }} # hashFiles returns a different value on windows
-
-      - name: Setup python
-        run: |
-          mkdir .venv
+          mkdir -p .venv
           python -m venv .venv
-
-      - name: Install deps
-        if: ${{ steps.deps-cache.outputs.cache-hit != 'true' }}
-        run: |
-          source .venv/bin/activate
-          nimble install_pinned
 
       - name: Use gcc 14
         if : ${{ matrix.platform.os == 'linux-gcc-14'}}
         run: |
-          # Add GCC-14 to alternatives
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 14
-
-          # Set GCC-14 as the default
           sudo update-alternatives --set gcc /usr/bin/gcc-14
 
       - name: Run tests
